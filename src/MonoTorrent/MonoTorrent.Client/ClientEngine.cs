@@ -41,6 +41,7 @@ using System.Threading.Tasks;
 using MonoTorrent.BEncoding;
 using MonoTorrent.Client.Listeners;
 using MonoTorrent.Client.PieceWriters;
+using MonoTorrent.Client.PortForwarding;
 using MonoTorrent.Client.RateLimiters;
 using MonoTorrent.Dht;
 
@@ -97,6 +98,7 @@ namespace MonoTorrent.Client
         /// </summary>
         readonly List<TorrentManager> allTorrents;
 
+        bool portForwardingEnabled;
         readonly RateLimiter uploadLimiter;
         readonly RateLimiterGroup uploadLimiters;
         readonly RateLimiter downloadLimiter;
@@ -115,13 +117,40 @@ namespace MonoTorrent.Client
 
         public bool Disposed { get; private set; }
 
+        /// <summary>
+        /// When set to <see langword="true"/> the engine will automatically forward
+        /// ports using uPnP and/or NAT-PMP compatible routers.
+        /// </summary>
+        public bool PortForwardingEnabled {
+            get => portForwardingEnabled;
+            set {
+                portForwardingEnabled = value;
+
+                if (value) {
+                    if (IsRunning && !PortForwarder.Active)
+                        PortForwarder.StartAsync (CancellationToken.None);
+                } else {
+                    if (PortForwarder.Active)
+                        PortForwarder.StopAsync (CancellationToken.None);
+                }
+            }
+        }
+
         public IPeerListener Listener { get; }
 
         public ILocalPeerDiscovery LocalPeerDiscovery { get; private set; }
 
+        /// <summary>
+        /// When <see cref="PortForwardingEnabled"/> is set to true, this will return a representation
+        /// of the ports the engine is managing.
+        /// </summary>
+        public Mappings PortMappings => PortForwardingEnabled ? PortForwarder.Mappings : Mappings.Empty;
+
         public bool IsRunning { get; private set; }
 
         public BEncodedString PeerId { get; }
+
+        internal IPortForwarder PortForwarder { get; }
 
         public EngineSettings Settings { get; }
 
@@ -197,6 +226,8 @@ namespace MonoTorrent.Client
             ConnectionManager = new ConnectionManager (PeerId, Settings, DiskManager);
             DhtEngine = new NullDhtEngine ();
             listenManager = new ListenManager (this);
+            PortForwarder = new MonoNatPortForwarder ();
+
             MainLoop.QueueTimeout (TimeSpan.FromMilliseconds (TickLength), delegate {
                 if (IsRunning && !Disposed)
                     LogicTick ();
@@ -546,19 +577,37 @@ namespace MonoTorrent.Client
         internal void Start ()
         {
             CheckDisposed ();
-            IsRunning = true;
-            if (Listener.Status == ListenerStatus.NotListening)
-                Listener.Start ();
+            if (!IsRunning) {
+                IsRunning = true;
+                if (Listener.Status == ListenerStatus.NotListening)
+                    Listener.Start ();
+                EnablePortForwarding ();
+            }
         }
 
+        async void EnablePortForwarding ()
+        {
+            await PortForwarder.RegisterMappingAsync (new Mapping (Protocol.Tcp, Settings.ListenPort));
+            if (PortForwardingEnabled) {
+                await PortForwarder.StartAsync (CancellationToken.None);
+            }
+        }
+
+        async void DisablePortForwarding ()
+        {
+            if (PortForwarder.Active)
+                await PortForwarder.StopAsync (true, CancellationToken.None);
+        }
 
         internal void Stop ()
         {
             CheckDisposed ();
             // If all the torrents are stopped, stop ticking
             IsRunning = allTorrents.Exists (m => m.State != TorrentState.Stopped);
-            if (!IsRunning)
+            if (!IsRunning) {
                 Listener.Stop ();
+                DisablePortForwarding ();
+            }
         }
 
         static BEncodedString GeneratePeerId ()
